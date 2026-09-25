@@ -1,5 +1,6 @@
 import pandas as pd
 import re
+import time
 
 def normalize_name(name):
     if pd.isna(name):
@@ -11,14 +12,17 @@ def normalize_name(name):
     tokens = [t for t in s.split() if t not in suffixes]
     return ' '.join(sorted(tokens))
 
-def build_baseline(s1, s2, s3):
+def build_baseline(s1, s2, s3, max_group_size=15):
     s1 = s1.copy(); s2 = s2.copy(); s3 = s3.copy()
     s1['norm'] = s1['business_name'].apply(normalize_name)
     s2['norm'] = s2['business_name'].apply(normalize_name)
     s3['norm'] = s3['business_name'].apply(normalize_name)
 
     s2_idx = s2.groupby(['country', 'norm'])['entity_id'].apply(list)
+    s2_idx = s2_idx[s2_idx.apply(len) <= max_group_size]
+
     s3_idx = s3.groupby(['country', 'norm'])['entity_id'].apply(list)
+    s3_idx = s3_idx[s3_idx.apply(len) <= max_group_size]
 
     keys = list(zip(s1['country'], s1['norm']))
 
@@ -33,15 +37,14 @@ def build_baseline(s1, s2, s3):
     })
 
 if __name__ == "__main__":
-    import time
     t0 = time.time()
-    s1 = pd.read_csv("dataset/train/train_source1.tsv", sep="\t")
-    print("s1 loaded", time.time()-t0)
-    s2 = pd.read_csv("dataset/train/train_source2.tsv", sep="\t")
-    print("s2 loaded", time.time()-t0)
-    s3 = pd.read_csv("dataset/train/train_source3.tsv", sep="\t")
-    print("s3 loaded", time.time()-t0)
-    result = build_baseline(s1, s2, s3)
+    s1 = pd.read_csv("dataset/test/test_source1.tsv", sep="\t")
+    s2 = pd.read_csv("dataset/test/test_source2.tsv", sep="\t")
+    s3 = pd.read_csv("dataset/test/test_source3.tsv", sep="\t")
+    print("data loaded", time.time()-t0)
+
+    result = build_baseline(s1, s2, s3, max_group_size=8)
     print("baseline built", time.time()-t0)
-    result.to_csv("output/matching_results_baseline.tsv", sep="\t", index=False)
+
+    result.to_csv("output/matching_results.tsv", sep="\t", index=False)
     print("Done. Rows:", len(result))
