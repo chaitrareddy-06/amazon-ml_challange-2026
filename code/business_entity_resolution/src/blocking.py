@@ -2,6 +2,7 @@ import pandas as pd
 import re
 import time
 import gc
+from itertools import combinations
 
 STOPWORDS = {'inc', 'llc', 'ltd', 'limited', 'corp', 'corporation',
              'llp', 'pvt', 'private', 'co', 'company', 'the', 'and'}
@@ -13,70 +14,104 @@ def tokenize(name):
     s = re.sub(r'[^\w\s]', ' ', s)
     return [t for t in s.split() if t not in STOPWORDS and len(t) > 1]
 
-def explode_tokens(df, id_col='entity_id'):
-    tmp = df[[id_col, 'country', 'tokens']].explode('tokens').dropna(subset=['tokens'])
-    tmp = tmp.rename(columns={'tokens': 'token'})
+def make_pair_tokens(tokens, max_pairs=6):
+    toks = sorted(set(tokens))[:6]
+    return ['|'.join(p) for p in combinations(toks, 2)][:max_pairs]
+
+def explode_col(df, id_col, token_col, out_name):
+    tmp = df[[id_col, 'country', token_col]].explode(token_col).dropna(subset=[token_col])
+    tmp = tmp.rename(columns={token_col: out_name})
     return tmp
 
-def cap_postings(tok_df, col='token', max_postings=300):
+def cap_postings(tok_df, col, max_postings=300):
     counts = tok_df[col].value_counts()
     keep = counts[counts <= max_postings].index
     return tok_df[tok_df[col].isin(keep)]
 
-def match_and_rank(s1_tok, src_df, label, max_postings=300, max_candidates=40, chunk_size=5000):
+def rank_merge(left_country, right_country, key_col, chunk_size, max_candidates):
+    """Runs the chunked, per-country merge+rank for one key column (token or pair_token)."""
+    all_counts = []
+    s1_ids_in_country = left_country['s1_id'].unique()
+    for i in range(0, len(s1_ids_in_country), chunk_size):
+        batch_ids = s1_ids_in_country[i:i+chunk_size]
+        left_batch = left_country[left_country['s1_id'].isin(batch_ids)]
+
+        merged = left_batch.merge(right_country, on=key_col)
+        if not merged.empty:
+            counts = merged.groupby(['s1_id', 'cand_id']).size().reset_index(name='shared')
+            counts = counts.sort_values(['s1_id', 'shared'], ascending=[True, False])
+            counts['rank'] = counts.groupby('s1_id').cumcount()
+            counts = counts[counts['rank'] < max_candidates]
+            all_counts.append(counts[['s1_id', 'cand_id']])
+        del merged
+        gc.collect()
+    return all_counts
+
+def match_and_rank(s1_tok_single, s1_tok_pair, src_df, label, max_postings=300,
+                    max_candidates=40, chunk_size=5000):
     src = src_df.copy()
     src['tokens'] = src['business_name'].apply(tokenize)
-    src_tok = explode_tokens(src, 'entity_id').rename(columns={'entity_id': 'cand_id', 'country': 'cand_country'})
+    src['pair_tokens'] = src['tokens'].apply(make_pair_tokens)
+
+    # ---- single-token pass ----
+    src_single = explode_col(src, 'entity_id', 'tokens', 'token').rename(columns={'entity_id': 'cand_id', 'country': 'cand_country'})
+    src_single = cap_postings(src_single, 'token', max_postings=max_postings)
+
+    all_counts = []
+    countries = s1_tok_single['s1_country'].dropna().unique()
+    for country in countries:
+        left_country = s1_tok_single[s1_tok_single['s1_country'] == country]
+        right_country = src_single[src_single['cand_country'] == country]
+        if left_country.empty or right_country.empty:
+            continue
+        all_counts.extend(rank_merge(left_country, right_country, 'token', chunk_size, max_candidates))
+        print(f"  [{label}-single] done country={country}", flush=True)
+
+    del src_single
+    gc.collect()
+
+    # ---- pair-token pass ----
+    src_pair = explode_col(src, 'entity_id', 'pair_tokens', 'pair_token').rename(columns={'entity_id': 'cand_id', 'country': 'cand_country'})
+    src_pair = cap_postings(src_pair, 'pair_token', max_postings=max_postings)
     del src
     gc.collect()
 
-    src_tok = cap_postings(src_tok, max_postings=max_postings)
-
-    all_counts = []
-    countries = s1_tok['s1_country'].dropna().unique()
+    countries = s1_tok_pair['s1_country'].dropna().unique()
     for country in countries:
-        left_country = s1_tok[s1_tok['s1_country'] == country]
-        right_country = src_tok[src_tok['cand_country'] == country]
+        left_country = s1_tok_pair[s1_tok_pair['s1_country'] == country]
+        right_country = src_pair[src_pair['cand_country'] == country]
         if left_country.empty or right_country.empty:
             continue
+        all_counts.extend(rank_merge(left_country, right_country, 'pair_token', chunk_size, max_candidates))
+        print(f"  [{label}-pair] done country={country}", flush=True)
 
-        s1_ids_in_country = left_country['s1_id'].unique()
-
-        for i in range(0, len(s1_ids_in_country), chunk_size):
-            batch_ids = s1_ids_in_country[i:i+chunk_size]
-            left_batch = left_country[left_country['s1_id'].isin(batch_ids)]
-
-            merged = left_batch.merge(right_country, on='token')
-            if not merged.empty:
-                counts = merged.groupby(['s1_id', 'cand_id']).size().reset_index(name='shared')
-                counts = counts.sort_values(['s1_id', 'shared'], ascending=[True, False])
-                counts['rank'] = counts.groupby('s1_id').cumcount()
-                counts = counts[counts['rank'] < max_candidates]
-                all_counts.append(counts[['s1_id', 'cand_id']])
-            del merged
-            gc.collect()
-
-        print(f"  [{label}] done country={country}", flush=True)
-
-    del src_tok
+    del src_pair
     gc.collect()
 
     if not all_counts:
         return pd.Series(dtype=object)
     counts = pd.concat(all_counts, ignore_index=True)
+    counts = counts.drop_duplicates(subset=['s1_id', 'cand_id'])
     return counts.groupby('s1_id')['cand_id'].apply(list)
 
 def build_candidates(s1, s2, s3, max_postings=300, max_candidates=40, chunk_size=5000):
     s1 = s1.copy()
     s1['tokens'] = s1['business_name'].apply(tokenize)
-    s1_tok = explode_tokens(s1, 'entity_id').rename(columns={'entity_id': 's1_id', 'country': 's1_country'})
-    s1_tok = cap_postings(s1_tok, max_postings=max_postings)
+    s1['pair_tokens'] = s1['tokens'].apply(make_pair_tokens)
+
+    s1_tok_single = explode_col(s1, 'entity_id', 'tokens', 'token').rename(columns={'entity_id': 's1_id', 'country': 's1_country'})
+    s1_tok_single = cap_postings(s1_tok_single, 'token', max_postings=max_postings)
+
+    s1_tok_pair = explode_col(s1, 'entity_id', 'pair_tokens', 'pair_token').rename(columns={'entity_id': 's1_id', 'country': 's1_country'})
+    s1_tok_pair = cap_postings(s1_tok_pair, 'pair_token', max_postings=max_postings)
 
     print("processing s2...", flush=True)
-    c2 = match_and_rank(s1_tok, s2, 's2', max_postings, max_candidates, chunk_size)
+    c2 = match_and_rank(s1_tok_single, s1_tok_pair, s2, 's2', max_postings, max_candidates, chunk_size)
+    gc.collect()
 
     print("processing s3...", flush=True)
-    c3 = match_and_rank(s1_tok, s3, 's3', max_postings, max_candidates, chunk_size)
+    c3 = match_and_rank(s1_tok_single, s1_tok_pair, s3, 's3', max_postings, max_candidates, chunk_size)
+    gc.collect()
 
     result = pd.DataFrame({'source1_entity_id': s1['entity_id']})
     result = result.merge(c2.rename('c2'), left_on='source1_entity_id', right_index=True, how='left')
